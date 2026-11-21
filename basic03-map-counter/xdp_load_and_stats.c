@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+
 static const char *__doc__ = "XDP loader and stats program\n"
 	" - Allows selecting BPF --progname name to XDP-attach to --dev\n";
 
@@ -97,7 +98,7 @@ struct record {
 };
 
 struct stats_record {
-	struct record stats[1]; /* Assignment#2: Hint */
+	struct record stats[XDP_ACTION_MAX]; /* Assignment#2: Hint */
 };
 
 static double calc_period(struct record *r, struct record *p)
@@ -123,18 +124,20 @@ static void stats_print(struct stats_record *stats_rec,
 	__u64 bytes;
 	double bps; // bytes per sec
 
+
+
 	/* Assignment#2: Print other XDP actions stats  */
-	{
+	for (__u32 action = 0; action < XDP_ACTION_MAX; action++) {
 		char *fmt = "%-12s %'11lld pkts (%'10.0f pps)"
 			" %'11lld Kbytes (%'6.0f Mbits/s)"
 			" period:%f\n";
-		const char *action = action2str(XDP_PASS);
-		rec  = &stats_rec->stats[0];
-		prev = &stats_prev->stats[0];
+		const char *action_name = action2str(action);
+		rec  = &stats_rec->stats[action];
+		prev = &stats_prev->stats[action];
 
 		period = calc_period(rec, prev);
 		if (period == 0)
-		       return;
+		       continue;
 
 		packets = rec->total.rx_packets - prev->total.rx_packets;
 		pps     = packets / period;
@@ -142,7 +145,7 @@ static void stats_print(struct stats_record *stats_rec,
 		bytes = rec->total.rx_bytes - prev->total.rx_bytes;
 		bps = bytes / period;
 
-		printf(fmt, action, rec->total.rx_packets, pps,
+		printf(fmt, action_name, rec->total.rx_packets, pps,
             rec->total.rx_bytes / 1000, (bps * 8) / 1000000.0, period);
 	}
 }
@@ -196,9 +199,10 @@ static void stats_collect(int map_fd, __u32 map_type,
 			  struct stats_record *stats_rec)
 {
 	/* Assignment#2: Collect other XDP actions stats  */
-	__u32 key = XDP_PASS;
 
-	map_collect(map_fd, map_type, key, &stats_rec->stats[0]);
+	for (__u32 action = 0; action < XDP_ACTION_MAX; action++) {
+		map_collect(map_fd, map_type, action, &stats_rec->stats[action]);
+	}
 }
 
 static void stats_poll(int map_fd, __u32 map_type, int interval)
