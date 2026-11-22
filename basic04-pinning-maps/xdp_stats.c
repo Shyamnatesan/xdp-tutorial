@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+#include <linux/bpf.h>
 static const char *__doc__ = "XDP stats program\n"
 	" - Finding xdp_stats_map via --dev name info\n";
 
@@ -191,9 +192,11 @@ static void stats_collect(int map_fd, __u32 map_type,
 	}
 }
 
-static void stats_poll(int map_fd, __u32 map_type, int interval)
+static void stats_poll(const char* pin_dir, int map_fd, __u32 map_id, __u32 map_type, int interval)
 {
+    struct bpf_map_info info = {0};
 	struct stats_record prev, record = { 0 };
+	int new_fd;
 
 	/* Trick to pretty printf with thousands separators use %' */
 	setlocale(LC_NUMERIC, "en_US");
@@ -204,6 +207,31 @@ static void stats_poll(int map_fd, __u32 map_type, int interval)
 
 	while (1) {
 		prev = record; /* struct copy */
+
+		new_fd = open_bpf_map_file(pin_dir, "xdp_stats_map", &info);
+		if (new_fd < 0) {
+		    sleep(interval);
+			continue;
+		}
+
+		if (info.id != map_id) {
+		    /* Different ID: the loader replaced the map */
+			printf("Map changed: id %u -> %u\n", map_id, info.id);
+
+			/* let go of the old map */
+			close(map_fd);
+			map_fd = new_fd;
+			map_id = info.id;
+			map_type = info.type;
+
+			stats_collect(map_fd, map_type, &record);
+			sleep(interval);
+			continue;
+		}
+
+		/* Same ID: same map, the fresh fd isn't needed */
+		close(new_fd);
+
 		stats_collect(map_fd, map_type, &record);
 		stats_print(&record, &prev);
 		sleep(interval);
@@ -270,6 +298,6 @@ int main(int argc, char **argv)
 		       );
 	}
 
-	stats_poll(stats_map_fd, info.type, interval);
+	stats_poll(pin_dir, stats_map_fd, info.id, info.type, interval);
 	return EXIT_OK;
 }

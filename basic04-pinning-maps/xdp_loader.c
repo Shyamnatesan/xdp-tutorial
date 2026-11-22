@@ -175,29 +175,93 @@ int main(int argc, char **argv)
 		return EXIT_OK;
 	}
 
-	program = load_bpf_and_xdp_attach(&cfg);
-	if (!program) {
-		err = EXIT_FAIL_BPF;
-		goto out;
-	}
 
-	if (verbose) {
-		printf("Success: Loaded BPF-object(%s) and used program(%s)\n",
-		       cfg.filename, cfg.progname);
-		printf(" - XDP prog attached on device:%s(ifindex:%d)\n",
-		       cfg.ifname, cfg.ifindex);
-	}
 
-	/* Use the --dev name as subdir for exporting/pinning maps */
-	err = pin_maps_in_bpf_object(xdp_program__bpf_obj(program), &cfg);
-	if (err) {
-		fprintf(stderr, "ERR: pinning maps\n");
-		goto out;
-	}
+	/* Step 1: open the object (nothing created in the kernel yet) */
+		DECLARE_LIBBPF_OPTS(bpf_object_open_opts, bpf_opts);
+		DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts,
+				    .open_filename = cfg.filename,
+				    .prog_name     = cfg.progname,
+				    .opts          = &bpf_opts);
 
-	err = EXIT_OK;
+		program = xdp_program__create(&xdp_opts);
+		err = libxdp_get_error(program);
+		if (err) {
+			char errmsg[1024];
+			libxdp_strerror(err, errmsg, sizeof(errmsg));
+			fprintf(stderr, "ERR: opening program: %s\n", errmsg);
+			return EXIT_FAIL_BPF;
+		}
 
-out:
-	xdp_program__close(program);
-	return err;
+		/* Detach any XDP program(s) already on this interface, so the new
+		 * one replaces them instead of running alongside them. Detaching
+		 * does not touch the pin file, so the reused map stays alive. */
+		struct xdp_multiprog *mp = xdp_multiprog__get_from_ifindex(cfg.ifindex);
+		if (!libxdp_get_error(mp)) {
+			xdp_multiprog__detach(mp);
+			xdp_multiprog__close(mp);
+		}
+
+		/* Step 2: if a pinned map exists, tell libbpf to reuse it */
+		char map_path[PATH_MAX];
+		bool reused = false;
+		int pinned_fd;
+
+		snprintf(map_path, PATH_MAX, "%s/%s", cfg.pin_dir, map_name);
+
+		pinned_fd = bpf_obj_get(map_path);
+		if (pinned_fd >= 0) {
+			struct bpf_object *bpf_obj = xdp_program__bpf_obj(program);
+			struct bpf_map *map = bpf_object__find_map_by_name(bpf_obj, map_name);
+
+			if (!map) {
+				fprintf(stderr, "ERR: map %s not found in object\n", map_name);
+				close(pinned_fd);
+				err = EXIT_FAIL_BPF;
+				goto out;
+			}
+
+			err = bpf_map__reuse_fd(map, pinned_fd);
+			close(pinned_fd);
+			if (err) {
+				fprintf(stderr, "ERR: reusing pinned map %s\n", map_path);
+				err = EXIT_FAIL_BPF;
+				goto out;
+			}
+			reused = true;
+			if (verbose)
+				printf(" - Reusing pinned map %s\n", map_path);
+		}
+
+		/* Step 3: attach (this is where the load happens) */
+		err = xdp_program__attach(program, cfg.ifindex, cfg.attach_mode, 0);
+		if (err) {
+			char errmsg[1024];
+			libxdp_strerror(err, errmsg, sizeof(errmsg));
+			fprintf(stderr, "ERR: attaching program: %s\n", errmsg);
+			err = EXIT_FAIL_BPF;
+			goto out;
+		}
+
+		if (verbose) {
+			printf("Success: Loaded BPF-object(%s) and used program(%s)\n",
+			       cfg.filename, cfg.progname);
+			printf(" - XDP prog attached on device:%s(ifindex:%d)\n",
+			       cfg.ifname, cfg.ifindex);
+		}
+
+		/* Step 4: pin only if we created a new map */
+		if (!reused) {
+			err = pin_maps_in_bpf_object(xdp_program__bpf_obj(program), &cfg);
+			if (err) {
+				fprintf(stderr, "ERR: pinning maps\n");
+				goto out;
+			}
+		}
+
+		err = EXIT_OK;
+
+	out:
+		xdp_program__close(program);
+		return err;
 }
